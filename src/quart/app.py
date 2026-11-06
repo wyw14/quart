@@ -77,7 +77,10 @@ from .signals import websocket_finished
 from .signals import websocket_started
 from .signals import websocket_tearing_down
 from .templating import _default_template_ctx_processor
+from .templating import _describe_context_processor
 from .templating import Environment
+from .templating import TemplateContextOverride
+from .templating import TemplateContextProcessorSource
 from .testing import make_test_body_with_headers
 from .testing import make_test_headers_path_and_query_string
 from .testing import make_test_scope
@@ -428,6 +431,22 @@ class Quart(App):
         jinja_env.policies["json.dumps_function"] = self.json.dumps
         return jinja_env
 
+    def _template_context_processor_scopes(
+        self, ctx: AppContext
+    ) -> list[AppOrBlueprintKey]:
+        """Return the processor scopes in actual execution order.
+
+        The app scope (``None``) is first followed by the blueprint
+        scopes from the parent blueprint down to the blueprint the
+        request/websocket is routed to.
+        """
+        names: list[AppOrBlueprintKey] = [None]
+        if has_request_context():
+            names.extend(reversed(ctx.request.blueprints))
+        elif has_websocket_context():
+            names.extend(reversed(ctx.websocket.blueprints))
+        return names
+
     async def update_template_context(self, ctx: AppContext, context: dict) -> None:
         """Update the provided template context.
 
@@ -437,20 +456,66 @@ class Quart(App):
         Arguments:
             context: The context to update (mutate).
         """
-        names = [None]
-        if has_request_context():
-            names.extend(reversed(ctx.request.blueprints))  # type: ignore
-        elif has_websocket_context():
-            names.extend(reversed(ctx.websocket.blueprints))  # type: ignore
-
         extra_context: dict[str, Any] = {}
-        for name in names:
+        for name in self._template_context_processor_scopes(ctx):
             for processor in self.template_context_processors[name]:
                 extra_context.update(await self.ensure_async(processor)())  # type: ignore[call-overload]
 
         original = context.copy()
         context.update(extra_context)
         context.update(original)
+
+    async def diagnose_template_context_overrides(
+        self, ctx: AppContext | None = None
+    ) -> list[TemplateContextOverride]:
+        """Report variables set by multiple template context processors.
+
+        The app and blueprint context processors are awaited in the
+        actual execution order for the current context (app processors
+        first, then parent blueprint processors down to the routed
+        blueprint processors). Every variable name provided by more
+        than one processor is returned as a
+        :class:`~quart.templating.TemplateContextOverride` listing the
+        ordered :class:`~quart.templating.TemplateContextProcessorSource`
+        objects that set it.
+
+        Only variable names and their sources are reported, never the
+        variable values, and no template context is created or mutated.
+        Both synchronous and asynchronous processors are awaited via
+        :meth:`ensure_async`.
+
+        Arguments:
+            ctx: The app context to diagnose. Defaults to the current
+                app context.
+        """
+        if ctx is None:
+            ctx = _cv_app.get(None)
+            if ctx is None:
+                raise RuntimeError("Working outside of application context")
+
+        sources: dict[str, list[TemplateContextProcessorSource]] = defaultdict(list)
+        first_seen: list[str] = []
+        index = 0
+        for scope in self._template_context_processor_scopes(ctx):
+            for processor in self.template_context_processors[scope]:
+                result = cast(dict[str, Any], await self.ensure_async(processor)())
+                for name in result:
+                    if name not in sources:
+                        first_seen.append(name)
+                    sources[name].append(
+                        TemplateContextProcessorSource(
+                            index=index,
+                            scope=scope,
+                            processor=_describe_context_processor(processor),
+                        )
+                    )
+                index += 1
+
+        return [
+            TemplateContextOverride(name=name, sources=tuple(sources[name]))
+            for name in first_seen
+            if len(sources[name]) > 1
+        ]
 
     @setupmethod
     def before_serving(

@@ -1,3 +1,11 @@
+## Unreleased
+
+- Add ``diagnose_template_context_overrides`` to report template
+  variables that are set repeatedly by the app and blueprint context
+  processors, with their sources in actual execution order. It reports
+  variable names and processor origins only, never values, and does not
+  mutate the template context.
+
 ## Version 0.23.1
 
 Released 2026-08-29

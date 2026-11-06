@@ -89,3 +89,24 @@ information to all requests to the app. An example,
     @blueprint.app_context_processor
     async def app_wide():
         return {'context': 'value'}
+
+Diagnosing context overrides
+----------------------------
+
+When more than one context processor sets the same variable the
+processor that runs last wins, with variables passed directly to the
+render call always winning. The processors run app first followed by
+the blueprint processors from the parent blueprint down to the
+blueprint the request is routed to.
+:func:`~quart.templating.diagnose_template_context_overrides` awaits
+the processors in this actual execution order for the current request
+or websocket and reports each variable that is set more than once
+together with the ordered sources that set it. Only variable names and
+the processor origins are returned, never the values, and the template
+context is not changed.
+
+.. code-block:: python
+
+    overrides = await diagnose_template_context_overrides()
+    for override in overrides:
+        print(override.name, [source.processor for source in override.sources])

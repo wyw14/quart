@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,58 @@ if TYPE_CHECKING:
     from .ctx import _AppCtxGlobals
     from .sessions import SessionMixin
     from .wrappers import Request
+
+
+@dataclass(frozen=True)
+class TemplateContextProcessorSource:
+    """The source of a variable injected by a context processor.
+
+    Only the variable name and its origin are recorded, never the
+    variable value.
+
+    Attributes:
+        index: Zero based position of the processor in the actual
+            execution order, i.e. app processors first followed by the
+            blueprint processors from the parent blueprint down to the
+            blueprint the request is routed to.
+        scope: Blueprint name the processor is registered for, or
+            ``None`` for an app wide processor.
+        processor: Qualified name of the processor callable
+            (``module.qualname``).
+    """
+
+    index: int
+    scope: str | None
+    processor: str
+
+
+@dataclass(frozen=True)
+class TemplateContextOverride:
+    """A template variable set by more than one context processor.
+
+    Attributes:
+        name: The template variable name that is set repeatedly.
+        sources: The processors that set the variable, ordered by
+            actual execution order. The last source in the tuple is the
+            processor that wins (unless the variable is also passed
+            explicitly to the render call, which always wins).
+    """
+
+    name: str
+    sources: tuple[TemplateContextProcessorSource, ...]
+
+
+def _describe_context_processor(processor: Any) -> str:
+    """Return a value-free qualified name for *processor*."""
+    qualname = getattr(processor, "__qualname__", None) or getattr(
+        processor, "__name__", None
+    )
+    module = getattr(processor, "__module__", None)
+    if qualname is not None and module is not None:
+        return f"{module}.{qualname}"
+    if qualname is not None:
+        return qualname
+    return repr(processor)
 
 
 class Environment(BaseEnvironment):
@@ -100,6 +153,25 @@ async def _default_template_ctx_processor() -> dict[str, Any]:
         context["request"] = ctx.request
         context["session"] = ctx.session
     return context
+
+
+async def diagnose_template_context_overrides() -> list[TemplateContextOverride]:
+    """Diagnose template variables set by multiple context processors.
+
+    The app and blueprint context processors are awaited in the same
+    order as during a render (app processors first, then the blueprint
+    processors from the parent blueprint down to the routed blueprint),
+    and every variable name that is set by more than one processor is
+    reported together with the ordered sources that set it.
+
+    Only variable names and their processor sources are returned, never
+    the variable values, and the diagnostic does not mutate or create a
+    template context. This must be called within an app context, and
+    blueprint processors are only considered within a request or
+    websocket context.
+    """
+    ctx = app_ctx._get_current_object()
+    return await current_app.diagnose_template_context_overrides(ctx)
 
 
 async def stream_template(

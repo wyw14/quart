@@ -45,10 +45,15 @@ from .signals import template_rendered as template_rendered
 from .signals import websocket_finished as websocket_finished
 from .signals import websocket_started as websocket_started
 from .signals import websocket_tearing_down as websocket_tearing_down
+from .templating import (
+    diagnose_template_context_overrides as diagnose_template_context_overrides,
+)
 from .templating import render_template as render_template
 from .templating import render_template_string as render_template_string
 from .templating import stream_template as stream_template
 from .templating import stream_template_string as stream_template_string
+from .templating import TemplateContextOverride as TemplateContextOverride
+from .templating import TemplateContextProcessorSource as TemplateContextProcessorSource
 from .typing import ResponseReturnValue as ResponseReturnValue
 from .wrappers import ClientDisconnectedError as ClientDisconnectedError
 from .wrappers import Request as Request
