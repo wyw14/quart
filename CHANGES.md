@@ -1,3 +1,14 @@
+## Version 0.24.0
+
+Unreleased
+
+- Add ``Quart.background_tasks_snapshot`` returning a read-only
+  snapshot of the background tasks in creation order with their
+  pending, completed, failed or cancelled status, alongside
+  cumulative completed, failed and cancelled counts. The snapshot
+  does not expose task callables, arguments, exception text or the
+  underlying tasks, and does not affect application shutdown.
+
 ## Version 0.23.1
 
 Released 2026-08-29

@@ -3,6 +3,9 @@ from __future__ import annotations
 from markupsafe import escape as escape
 from markupsafe import Markup as Markup
 
+from .app import BackgroundTaskInfo as BackgroundTaskInfo
+from .app import BackgroundTasksSnapshot as BackgroundTasksSnapshot
+from .app import BackgroundTaskStatus as BackgroundTaskStatus
 from .app import Quart as Quart
 from .blueprints import Blueprint as Blueprint
 from .config import Config as Config

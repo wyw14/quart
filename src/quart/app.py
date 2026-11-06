@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import enum
+import functools
+import itertools
 import os
 import signal
 import sys
@@ -10,6 +13,7 @@ from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Coroutine
+from dataclasses import dataclass
 from datetime import timedelta
 from inspect import isasyncgen
 from inspect import iscoroutinefunction
@@ -143,6 +147,124 @@ def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
         return value
 
     return timedelta(seconds=value)
+
+
+class BackgroundTaskStatus(enum.StrEnum):
+    """The status of a background task."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTaskInfo:
+    """Read-only status of a single background task.
+
+    Attributes:
+        id: Monotonic identifier of the task, starting at one. It
+            reflects the task creation order.
+        status: Current :class:`BackgroundTaskStatus` of the task.
+    """
+
+    id: int
+    status: BackgroundTaskStatus
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTasksSnapshot:
+    """Read-only snapshot of the background tasks.
+
+    This is a copy of the state as it was when the snapshot was taken,
+    it is not updated as tasks finish. It only contains task
+    identifiers and statuses - not the tasks themselves, their
+    arguments, or any exception text.
+
+    Attributes:
+        tasks: Every task in creation order, with its current status.
+        completed: Cumulative number of tasks that finished normally.
+        failed: Cumulative number of tasks that raised an exception.
+        cancelled: Cumulative number of tasks that were cancelled.
+    """
+
+    tasks: tuple[BackgroundTaskInfo, ...]
+    completed: int
+    failed: int
+    cancelled: int
+
+    @property
+    def total(self) -> int:
+        """The total number of tasks that have been added."""
+        return len(self.tasks)
+
+    @property
+    def pending(self) -> int:
+        """The number of tasks that are waiting to finish."""
+        return self.total - self.completed - self.failed - self.cancelled
+
+
+class _BackgroundTaskRegistry:
+    """Records background tasks in creation order and their outcomes.
+
+    References to the asyncio tasks are only held until they finish,
+    hence snapshots can never expose mutable tasks, their coroutine
+    arguments, or exception details.
+    """
+
+    def __init__(self, tasks: set[asyncio.Task[Any]]) -> None:
+        self._tasks = tasks
+        self._status: dict[int, BackgroundTaskStatus] = {}
+        self._ids = itertools.count(1)
+        self.completed = 0
+        self.failed = 0
+        self.cancelled = 0
+
+    def create_task(
+        self, coroutine_factory: Callable[[int], Coroutine[Any, Any, None]]
+    ) -> asyncio.Task[None]:
+        task_id = next(self._ids)
+        self._status[task_id] = BackgroundTaskStatus.PENDING
+        task = asyncio.get_event_loop().create_task(coroutine_factory(task_id))
+        self._tasks.add(task)
+        task.add_done_callback(functools.partial(self._on_done, task_id))
+        return task
+
+    def mark_failed(self, task_id: int) -> None:
+        # The task wrapper logs then swallows exceptions, hence the
+        # task itself always completes. Record the failure before the
+        # done callback runs so that it is classified correctly.
+        self._status[task_id] = BackgroundTaskStatus.FAILED
+
+    def _on_done(self, task_id: int, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            status = BackgroundTaskStatus.CANCELLED
+        elif self._status[task_id] is BackgroundTaskStatus.FAILED:
+            status = BackgroundTaskStatus.FAILED
+        elif task.exception() is not None:
+            status = BackgroundTaskStatus.FAILED
+        else:
+            status = BackgroundTaskStatus.COMPLETED
+        self._status[task_id] = status
+
+        if status is BackgroundTaskStatus.COMPLETED:
+            self.completed += 1
+        elif status is BackgroundTaskStatus.FAILED:
+            self.failed += 1
+        else:
+            self.cancelled += 1
+
+    def snapshot(self) -> BackgroundTasksSnapshot:
+        return BackgroundTasksSnapshot(
+            tasks=tuple(
+                BackgroundTaskInfo(task_id, status)
+                for task_id, status in self._status.items()
+            ),
+            completed=self.completed,
+            failed=self.failed,
+            cancelled=self.cancelled,
+        )
 
 
 class Quart(App):
@@ -314,6 +436,7 @@ class Quart(App):
             AppOrBlueprintKey, list[AfterWebsocketCallable]
         ] = defaultdict(list)
         self.background_tasks: set[asyncio.Task] = set()
+        self._background_task_registry = _BackgroundTaskRegistry(self.background_tasks)
         self.before_serving_funcs: list[Callable[[], Awaitable[None]]] = []
         self.before_websocket_funcs: dict[
             AppOrBlueprintKey, list[BeforeWebsocketCallable]
@@ -1376,16 +1499,28 @@ class Quart(App):
         return self.request_context(request)
 
     def add_background_task(self, func: Callable, *args: Any, **kwargs: Any) -> None:
-        async def _wrapper() -> None:
+        async def _wrapper(task_id: int) -> None:
             async with self.app_context() as ctx:
                 try:
                     await self.ensure_async(func)(*args, **kwargs)
                 except Exception as error:
+                    self._background_task_registry.mark_failed(task_id)
                     await self.handle_background_exception(ctx, error)
 
-        task = asyncio.get_event_loop().create_task(_wrapper())
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        self._background_task_registry.create_task(_wrapper)
+
+    def background_tasks_snapshot(self) -> BackgroundTasksSnapshot:
+        """Return a read-only snapshot of the background tasks.
+
+        The snapshot lists every task in creation order with its
+        current :class:`BackgroundTaskStatus` and the cumulative
+        numbers of tasks that have completed, failed, or been
+        cancelled. It is a copy taken at call time, and it only
+        contains task identifiers and statuses - the tasks
+        themselves, their arguments, and any exception text are not
+        exposed.
+        """
+        return self._background_task_registry.snapshot()
 
     async def handle_background_exception(
         self, ctx: AppContext, error: Exception

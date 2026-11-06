@@ -51,6 +51,31 @@ thread.
     slow the server.
 
 
+Inspecting background tasks
+---------------------------
+
+A read-only snapshot of the background tasks can be obtained via the
+``background_tasks_snapshot`` method:
+
+.. code-block:: python
+
+    snapshot = app.background_tasks_snapshot()
+    print(snapshot.pending, snapshot.completed, snapshot.failed, snapshot.cancelled)
+    for task in snapshot.tasks:
+        print(task.id, task.status.value)
+
+``tasks`` lists every task in creation order, with a status of
+``pending``, ``completed``, ``failed`` or ``cancelled``. The
+``completed``, ``failed`` and ``cancelled`` attributes are cumulative
+counts for the lifetime of the app, with ``pending`` and ``total``
+available as properties.
+
+The snapshot is a copy taken at call time and is not updated as tasks
+finish. It only contains task identifiers and statuses - the task
+callables, their arguments, the tasks themselves, and any exception
+text are not exposed. Taking a snapshot has no effect on how tasks are
+awaited or cancelled during shutdown.
+
 Testing background tasks
 ------------------------
 
