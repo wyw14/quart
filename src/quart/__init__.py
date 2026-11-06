@@ -50,6 +50,7 @@ from .templating import render_template_string as render_template_string
 from .templating import stream_template as stream_template
 from .templating import stream_template_string as stream_template_string
 from .typing import ResponseReturnValue as ResponseReturnValue
+from .wrappers import BodyReadStats as BodyReadStats
 from .wrappers import ClientDisconnectedError as ClientDisconnectedError
 from .wrappers import Request as Request
 from .wrappers import Response as Response

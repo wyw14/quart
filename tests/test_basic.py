@@ -132,6 +132,38 @@ async def test_implicit_json_list(app: Quart) -> None:
     assert b'["a",2]\n' == (await response.get_data())
 
 
+async def test_body_read_stats() -> None:
+    app = Quart(__name__)
+    app.config["BODY_READ_STATS"] = True
+
+    @app.route("/", methods=["POST"])
+    async def body_stats() -> ResponseReturnValue:
+        await request.get_data()
+        stats = request.body_read_stats
+        return jsonify(
+            bytes_received=stats.bytes_received,
+            chunks_received=stats.chunks_received,
+            status=stats.status,
+        )
+
+    test_client = app.test_client()
+    response = await test_client.post("/", data=b"abcde")
+    assert response.status_code == 200
+    assert await response.get_json() == {
+        "bytes_received": 5,
+        "chunks_received": 1,
+        "status": "completed",
+    }
+
+    response = await test_client.post("/", data=b"")
+    assert response.status_code == 200
+    assert await response.get_json() == {
+        "bytes_received": 0,
+        "chunks_received": 0,
+        "status": "completed",
+    }
+
+
 async def test_werkzeug(app: Quart) -> None:
     test_client = app.test_client()
     response = await test_client.get("/werkzeug/")

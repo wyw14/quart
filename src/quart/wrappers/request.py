@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Generator
+from dataclasses import dataclass
 from typing import Any
 from typing import Literal
 from typing import NoReturn
@@ -32,6 +33,76 @@ SERVER_PUSH_HEADERS_TO_COPY = {
     "user-agent",
 }
 
+#: Status of the request body reception tracked by :class:`BodyReadStats`.
+BodyReadStatus = Literal["receiving", "completed", "too_large", "cancelled"]
+
+
+@dataclass(frozen=True, slots=True)
+class BodyReadStats:
+    """Read-only snapshot of request body reception statistics.
+
+    Only metadata about the received body is retained; the body
+    contents are never cached or exposed by this object.
+
+    Attributes:
+        bytes_received: Total number of body bytes received so far.
+        chunks_received: Number of non-empty body chunks received so
+            far.
+        status: Reception status, one of ``"receiving"`` (in
+            progress), ``"completed"`` (received in full),
+            ``"too_large"`` (the configured ``MAX_CONTENT_LENGTH`` was
+            exceeded) or ``"cancelled"`` (the client disconnected
+            before completion).
+    """
+
+    bytes_received: int
+    chunks_received: int
+    status: BodyReadStatus
+
+
+class _BodyReadStatsRecorder:
+    """Mutable accumulator backing :class:`BodyReadStats` snapshots.
+
+    Only chunk lengths are passed in, hence request content can never
+    be retained here. The first terminal status reached is sticky.
+    """
+
+    def __init__(self, max_content_length: int | None) -> None:
+        self._max_content_length = max_content_length
+        self._bytes_received = 0
+        self._chunks_received = 0
+        self._status: BodyReadStatus = "receiving"
+
+    def record_chunk(self, length: int) -> None:
+        self._bytes_received += length
+        if length > 0:
+            self._chunks_received += 1
+        if (
+            self._status == "receiving"
+            and self._max_content_length is not None
+            and self._bytes_received > self._max_content_length
+        ):
+            self._status = "too_large"
+
+    def mark_completed(self) -> None:
+        if self._status == "receiving":
+            self._status = "completed"
+
+    def mark_cancelled(self) -> None:
+        if self._status == "receiving":
+            self._status = "cancelled"
+
+    def mark_too_large(self) -> None:
+        if self._status == "receiving":
+            self._status = "too_large"
+
+    def snapshot(self) -> BodyReadStats:
+        return BodyReadStats(
+            bytes_received=self._bytes_received,
+            chunks_received=self._chunks_received,
+            status=self._status,
+        )
+
 
 class Body:
     """A request body container.
@@ -51,12 +122,19 @@ class Body:
     """
 
     def __init__(
-        self, expected_content_length: int | None, max_content_length: int | None
+        self,
+        expected_content_length: int | None,
+        max_content_length: int | None,
+        *,
+        enable_read_stats: bool = False,
     ) -> None:
         self._data: bytes | None = None
         self._complete: asyncio.Event = asyncio.Event()
         self._max_content_length = max_content_length
         self._queue = asyncio.Queue[bytes]()
+        self._read_stats_recorder: _BodyReadStatsRecorder | None = (
+            _BodyReadStatsRecorder(max_content_length) if enable_read_stats else None
+        )
 
         # Exceptions must be raised within application (not ASGI)
         # calls, this is achieved by having the ASGI methods set this
@@ -68,6 +146,26 @@ class Body:
             and expected_content_length > max_content_length
         ):
             self._must_raise = RequestEntityTooLarge()
+            self._mark_read_stats_too_large()
+
+    @property
+    def read_stats(self) -> BodyReadStats | None:
+        """A read-only snapshot of body reception statistics.
+
+        Returns ``None`` unless body read statistics were explicitly
+        enabled. The snapshot never contains body contents.
+        """
+        if self._read_stats_recorder is None:
+            return None
+        return self._read_stats_recorder.snapshot()
+
+    def _record_received(self, data: bytes) -> None:
+        if self._read_stats_recorder is not None:
+            self._read_stats_recorder.record_chunk(len(data))
+
+    def _mark_read_stats_too_large(self) -> None:
+        if self._read_stats_recorder is not None:
+            self._read_stats_recorder.mark_too_large()
 
     def __aiter__(self) -> Body:
         return self
@@ -103,11 +201,13 @@ class Body:
                 self._max_content_length is not None
                 and len(data) > self._max_content_length
             ):
+                self._mark_read_stats_too_large()
                 raise RequestEntityTooLarge()
         self._data = bytes(data)
         return self._data
 
     async def put(self, data: bytes) -> None:
+        self._record_received(data)
         await self._queue.put(data)
 
     async def get(self) -> bytes:
@@ -120,14 +220,19 @@ class Body:
                 raise ClientDisconnectedError() from None
 
     def disconnect(self) -> None:
+        if self._read_stats_recorder is not None:
+            self._read_stats_recorder.mark_cancelled()
         self._queue.shutdown()
 
     def set_complete(self) -> None:
+        if self._read_stats_recorder is not None:
+            self._read_stats_recorder.mark_completed()
         self._complete.set()
         self._queue.shutdown()
 
     def set_result(self, data: bytes) -> None:
         """Convenience method, mainly for testing."""
+        self._record_received(data)
         self._queue.put_nowait(data)
         self.set_complete()
 
@@ -168,6 +273,7 @@ class Request(BaseRequestWebsocket):
         *,
         max_content_length: int | None = None,
         body_timeout: int | None = None,
+        body_read_stats: bool = False,
         send_push_promise: Callable[[str, Headers], Awaitable[None]],
     ) -> None:
         """Create a request object.
@@ -187,6 +293,11 @@ class Request(BaseRequestWebsocket):
                 body (None implies no limit in Quart).
             body_timeout: The maximum time (seconds) to wait for the
                 body before timing out.
+            body_read_stats: If True the body accumulates read
+                statistics (received bytes and chunks, and completion,
+                over-limit or cancellation status) exposed via
+                :attr:`body_read_stats`. The body contents are never
+                cached by the statistics.
             send_push_promise: An awaitable to send a push promise based
                 off of this request (HTTP/2 feature).
             scope: Underlying ASGI scope dictionary.
@@ -195,7 +306,11 @@ class Request(BaseRequestWebsocket):
             method, scheme, path, query_string, headers, root_path, http_version, scope
         )
         self.body_timeout = body_timeout
-        self.body = self.body_class(self.content_length, max_content_length)
+        self.body = self.body_class(
+            self.content_length,
+            max_content_length,
+            enable_read_stats=body_read_stats,
+        )
         self._cached_json: dict[bool, Any] = {False: Ellipsis, True: Ellipsis}
         self._form: MultiDict | None = None
         self._files: MultiDict | None = None
@@ -243,6 +358,16 @@ class Request(BaseRequestWebsocket):
     @max_form_parts.setter
     def max_form_parts(self, value: int | None) -> None:
         self._max_form_parts = value
+
+    @property
+    def body_read_stats(self) -> BodyReadStats | None:
+        """Read-only snapshot of the body reception statistics.
+
+        ``None`` unless the statistics were explicitly enabled. The
+        snapshot only contains received byte/chunk counters and a
+        terminal status; it never exposes any body contents.
+        """
+        return self.body.read_stats
 
     @property
     async def stream(self) -> NoReturn:

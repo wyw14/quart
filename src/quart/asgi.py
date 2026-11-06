@@ -95,6 +95,7 @@ class ASGIHTTPConnection:
             self.scope["http_version"],
             max_content_length=self.app.config["MAX_CONTENT_LENGTH"],
             body_timeout=self.app.config["BODY_TIMEOUT"],
+            body_read_stats=self.app.config["BODY_READ_STATS"],
             send_push_promise=partial(self._send_push_promise, send),
             scope=self.scope,
         )

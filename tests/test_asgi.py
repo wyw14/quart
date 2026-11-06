@@ -17,6 +17,26 @@ from quart.asgi import _handle_exception
 from quart.asgi import ASGIHTTPConnection
 from quart.asgi import ASGIWebsocketConnection
 from quart.utils import encode_headers
+from quart.wrappers.request import BodyReadStats
+
+
+def _body_stats_scope() -> HTTPScope:
+    return {
+        "type": "http",
+        "asgi": {},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"quart")],
+        "client": ("127.0.0.1", 80),
+        "server": None,
+        "extensions": {},
+        "state": {},  # type: ignore[typeddict-item]
+    }
 
 
 @pytest.mark.parametrize(
@@ -132,6 +152,98 @@ async def test_http_request_without_body(request_message: dict) -> None:
         )
 
     assert body == b""
+
+
+async def test_http_body_read_stats_disabled_by_default() -> None:
+    app = Quart(__name__)
+    connection = ASGIHTTPConnection(app, _body_stats_scope())
+    request = connection._create_request_from_scope(lambda: None)  # type: ignore
+    assert request.body_read_stats is None
+
+
+async def test_http_body_read_stats_chunked_completion() -> None:
+    app = Quart(__name__)
+    app.config["BODY_READ_STATS"] = True
+    connection = ASGIHTTPConnection(app, _body_stats_scope())
+    request = connection._create_request_from_scope(lambda: None)  # type: ignore
+    assert request.body_read_stats == BodyReadStats(0, 0, "receiving")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait({"type": "http.request", "body": b"ab", "more_body": True})
+    queue.put_nowait({"type": "http.request", "body": b"cde", "more_body": False})
+
+    async def receive() -> ASGIReceiveEvent:
+        return await queue.get()
+
+    body = None
+
+    async def _handle_request() -> None:
+        nonlocal body
+        body = await asyncio.wait_for(request.body, timeout=1)
+        # The server observes a disconnect once the response is sent
+        queue.put_nowait({"type": "http.disconnect"})
+
+    async with asyncio.TaskGroup() as task_group:
+        request_task = task_group.create_task(_handle_request())
+        task_group.create_task(
+            connection.handle_messages(request, receive, request_task)
+        )
+
+    assert body == b"abcde"
+    # A disconnect after completion must not overwrite the status
+    assert request.body_read_stats == BodyReadStats(5, 2, "completed")
+
+
+async def test_http_body_read_stats_empty_body() -> None:
+    app = Quart(__name__)
+    app.config["BODY_READ_STATS"] = True
+    connection = ASGIHTTPConnection(app, _body_stats_scope())
+    request = connection._create_request_from_scope(lambda: None)  # type: ignore
+
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait({"type": "http.request", "body": b"", "more_body": False})
+
+    async def receive() -> ASGIReceiveEvent:
+        return await queue.get()
+
+    body = None
+
+    async def _handle_request() -> None:
+        nonlocal body
+        body = await asyncio.wait_for(request.body, timeout=1)
+        queue.put_nowait({"type": "http.disconnect"})
+
+    async with asyncio.TaskGroup() as task_group:
+        request_task = task_group.create_task(_handle_request())
+        task_group.create_task(
+            connection.handle_messages(request, receive, request_task)
+        )
+
+    assert body == b""
+    assert request.body_read_stats == BodyReadStats(0, 0, "completed")
+
+
+async def test_http_body_read_stats_client_disconnect() -> None:
+    app = Quart(__name__)
+    app.config["BODY_READ_STATS"] = True
+    connection = ASGIHTTPConnection(app, _body_stats_scope())
+    request = connection._create_request_from_scope(lambda: None)  # type: ignore
+
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait({"type": "http.request", "body": b"ab", "more_body": True})
+    queue.put_nowait({"type": "http.disconnect"})
+
+    async def receive() -> ASGIReceiveEvent:
+        return await queue.get()
+
+    request_task = asyncio.ensure_future(asyncio.sleep(10))
+    await asyncio.wait_for(
+        connection.handle_messages(request, receive, request_task), timeout=1
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    assert request.body_read_stats == BodyReadStats(2, 1, "cancelled")
 
 
 async def test_websocket_completion() -> None:

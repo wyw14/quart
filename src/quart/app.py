@@ -223,6 +223,7 @@ class Quart(App):
         | {
             "APPLICATION_ROOT": "/",
             "BACKGROUND_TASK_SHUTDOWN_TIMEOUT": 5,  # Second
+            "BODY_READ_STATS": False,
             "BODY_TIMEOUT": 60,  # Second
             "DEBUG": None,
             "ENV": None,
@@ -1369,6 +1370,7 @@ class Quart(App):
             headers,
             root_path,
             http_version,
+            body_read_stats=self.config["BODY_READ_STATS"],
             send_push_promise=send_push_promise,
             scope=scope,
         )
